@@ -27,3 +27,12 @@ def vector_angle(vec_a, vec_b):
     cos_theta = dot / (norm_a * norm_b)
     theta = np.arccos(cos_theta)
     return theta
+
+def to_homogenous(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    assert rotation.shape == (3, 3)
+    assert translation.shape == (3,)
+
+    homogenous_matrix = np.eye(4)
+    homogenous_matrix[:3, :3] = rotation
+    homogenous_matrix[:3, 3] = translation
+    return homogenous_matrix

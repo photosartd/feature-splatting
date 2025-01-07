@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 from torchtyping import TensorType
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -30,6 +30,37 @@ class ViewerUtils:
     
     def get_text_embed(self, name_key: str) -> Optional[torch.Tensor]:
         return self.text_embedding_dict[name_key][1]
+    
+    @torch.no_grad()
+    @lru_cache(maxsize=128)
+    def wordwise_embeddings(self, words: Tuple[str]) -> torch.Tensor:
+        """
+        words: [n]
+        Returns: torch.Tensor of [n, emb_dim]
+        TODO: loop in python is bad
+        """
+        embeds = []
+        for word in words:
+            embed = self.text_encoding_func([word])
+            embeds.append(embed)
+        return torch.stack(embeds)
+    
+    def get_wordwise_embeddings(self, name_key: Union[str, List]) -> Optional[torch.Tensor]:
+        all_words = []
+        if isinstance(name_key, str):
+            name_key = [name_key]
+        for key in name_key:
+            if key in self.text_embedding_dict:
+                words = self.text_embedding_dict[name_key][0]
+                all_words.extend(words)
+            else:
+                raise ValueError(f"Key {key} not found in text_embedding_dict")
+        return self.wordwise_embeddings(all_words)
+    
+    def get_key_word_sizes(self, keys: List[str]) -> List[int]:
+        """Returns the number of words in each key"""
+        return [len(self.text_embedding_dict[key][0]) for key in keys]
+        
     
     def get_embed_shape(self, name_key: str) -> Optional[Tuple[int]]:
         embed = self.get_text_embed(name_key)

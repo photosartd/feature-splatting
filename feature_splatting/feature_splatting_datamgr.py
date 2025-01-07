@@ -1,6 +1,7 @@
 import gc
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Tuple, Type
+from pathlib import Path
 from nerfstudio.cameras.cameras import Cameras, CameraType
 
 import numpy as np
@@ -69,6 +70,7 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         self.train_dataset.metadata["feature_dim_dict"] = feature_dim_dict
         self.train_dataset.metadata["main_feature_name"] = feat_type_to_main_feature_name[self.config.feature_type]
         self.train_dataset.metadata["clip_model_name"] = feat_type_to_args[self.config.feature_type].clip_model_name
+        self.train_dataset.metadata["data_dir"] = self.get_data_dir()
 
         # Garbage collect
         torch.cuda.empty_cache()
@@ -123,3 +125,11 @@ class FeatureSplattingDataManager(FullImageDatamanager):
             feature_dict[feature_name] = self.eval_feature_dict[feature_name][camera_idx]
         data["feature_dict"] = feature_dict
         return camera, data
+    
+    def get_data_dir(self) -> Path:
+        data: Path = self.get_datapath()
+        if data.suffix == ".json":
+            data_dir = data.parent
+        else:
+            data_dir = data
+        return data_dir

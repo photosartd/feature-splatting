@@ -1,3 +1,7 @@
+from typing import Tuple
+
+import torch
+from pytorch3d.ops import knn_points
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from .math_utils import point_to_plane_distance, vector_angle
@@ -68,12 +72,53 @@ def estimate_ground(ground_pts, distance_threshold=0.005, rotation_flip=False):
 
     return (rotation_matrix, np.array((0, origin_plane_distance, 0)), inliers)
 
+def estimate_plane(pc: np.ndarray, distance_threshold: float = 0.005, downsample_voxel_size: float = 0.05) -> Tuple[tuple, np.ndarray]:
+    import open3d as o3d
+    point_cloud = pc.copy()
+    print(f"RANSAC pc start size: {point_cloud.shape}")
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(point_cloud)
+    downsampled_pcd = pcd.voxel_down_sample(voxel_size=downsample_voxel_size)
+    print(f"RANSAC ps downsampled: {len(downsampled_pcd.points)}")
+
+    #cl, ind = downsampled_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    inlier_cloud = downsampled_pcd#.select_by_index(ind)
+    print(f"RANSAC ps inlier_cloud: {len(inlier_cloud.points)}")
+
+    plane_model, inliers = inlier_cloud.segment_plane(distance_threshold=distance_threshold,
+                                                  ransac_n=3,
+                                                  num_iterations=2000)
+    return plane_model, np.asarray(inlier_cloud.select_by_index(inliers).points)
+
 def get_ground_bbox_min_max(all_xyz_n3, selected_obj_idx, ground_R, ground_T):
     """
     Select points within a bounding box.
     """
-    particles = all_xyz_n3 @ ground_R.T
+    particles = all_xyz_n3 @ ground_R.T # translates and rotates points to the ground CS
     particles += ground_T
     xyz_min = np.min(particles[selected_obj_idx], axis=0)
     xyz_max = np.max(particles[selected_obj_idx], axis=0)
     return xyz_min, xyz_max
+
+def get_bbox_min_max(particles: torch.Tensor) -> torch.Tensor:
+    return torch.stack(
+        [torch.min(particles, dim=0)[0],
+        torch.max(particles, dim=0)[0]]
+    )
+
+def knn_infilling(all_xyz_n3: torch.Tensor, obj_idx, k=50, dilation_iters=3, positive_ratio=0.8):
+    obj_idx = obj_idx.copy()
+    for _ in range(dilation_iters):
+        non_fg_xyz = all_xyz_n3[~obj_idx]
+        dists_nk, indices_nk = knn_points(all_xyz_n3[obj_idx][None], non_fg_xyz[None], K=k)
+        dists_nk = dists_nk.squeeze(0)
+        indices_nk = indices_nk.squeeze(0)
+        positive_cnt = obj_idx[indices_nk].sum(axis=1) # for any point - how many of its neighbors are positive (relate to the object)
+        non_fg_indices = torch.arange(all_xyz_n3.shape[0])[~obj_idx] # indices of non-fg points
+        non_fg_indices = non_fg_indices[positive_cnt > int(k * positive_ratio)] # select points that have enough positive neighbors
+        obj_idx[non_fg_indices] = True # dilate the object
+    return obj_idx
+
+
+

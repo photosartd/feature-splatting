@@ -16,6 +16,21 @@ class gaussian_editor:
         # There may be a better way to do this, but for now we use a lock
         self.editors_lock = threading.Lock()
 
+    @property
+    def bbox(self) -> torch.Tensor:
+        with self.editors_lock:
+            if 'xyz_min' in self.meta_editing_dict and 'xyz_max' in self.meta_editing_dict:
+                xyz_min = self.meta_editing_dict['xyz_min']
+                xyz_max = self.meta_editing_dict['xyz_max']
+                # Stack min and max into a single tensor for convenience
+                return torch.stack([xyz_min, xyz_max]).detach().cpu()
+            else:
+                raise ValueError("Bounding box not set. Please register 'xyz_min' and 'xyz_max' first.")
+            
+    @property
+    def bbox_mean(self) -> torch.Tensor:
+        return self.bbox.mean(dim=0)
+
     def register_object_minimax(self, xyz_min, xyz_max):
         # Object bounding box minimax
         self.meta_editing_dict['xyz_min'] = torch.tensor(xyz_min).cuda().float()
@@ -170,13 +185,17 @@ class gaussian_editor:
             bbox_particle_idx = self.filter_particles_ground_bbox(means,
                                                                     kwargs['min_offset'],
                                                                     kwargs['max_offset'])
-
             # Hide particles outside the bounding box?
             if view_main_obj_only:
                 bg_idx = ~bbox_particle_idx
                 if 'original_opacities' not in self.particle_modification_buffer:
                     self.particle_modification_buffer['original_opacities'] = opacities.clone()
                 opacities[bg_idx] = -5 # in-place modification
+
+            if kwargs.get("delete_main_obj", False):
+                if 'original_opacities' not in self.particle_modification_buffer:
+                    self.particle_modification_buffer['original_opacities'] = opacities.clone()
+                opacities[bbox_particle_idx] = -5 # in-place modification
             
             if "translation" in editing_dict:
                 if 'original_means' not in self.particle_modification_buffer:
@@ -257,6 +276,21 @@ class gaussian_editor:
         xyz_min = self.meta_editing_dict['xyz_min'] - min_offset
         xyz_max = self.meta_editing_dict['xyz_max'] + max_offset
         bbox_particles_idx = ((particles > xyz_min) & (particles < xyz_max)).all(dim=1)
+        return bbox_particles_idx
+    
+    @staticmethod
+    def filter_particles_bbox(
+        means: torch.Tensor,
+        ground_R: torch.Tensor,
+        ground_T: torch.Tensor,
+        xyz_min: torch.Tensor,
+        xyz_max: torch.Tensor
+        ) -> torch.Tensor:
+        
+        particles = means @ ground_R.T
+        particles += ground_T
+        bbox_particles_idx = ((particles > xyz_min) & (particles < xyz_max)).all(dim=1)
+        
         return bbox_particles_idx
 
 def get_gaussian_rotation(rot_mat, r):

@@ -1,6 +1,11 @@
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+from pathlib import Path
+from datetime import date
+from functools import cached_property
+import threading
 
 import numpy as np
 import torch
@@ -16,8 +21,11 @@ from nerfstudio.viewer.server.viewer_elements import (
     ViewerCheckbox,
     ViewerSlider,
     ViewerVec3,
+    ViewerControl,
+    ViewerDropdown
 )
 from nerfstudio.data.scene_box import OrientedBox
+from nerfstudio.viewer.viewer import VISER_NERFSTUDIO_SCALE_RATIO
 
 # Feature splatting functions
 from torch.nn import Parameter
@@ -29,9 +37,17 @@ from feature_splatting.utils import (
     compute_similarity,
     cluster_instance,
     estimate_ground,
+    estimate_plane,
+    knn_infilling,
     get_ground_bbox_min_max,
-    gaussian_editor
+    gaussian_editor,
+    to_homogenous,
+    get_bbox_min_max
 )
+from feature_splatting.utils.viewer import MeshController, MeshData, MeshSimpleData, MeshSelectionMode, MeshUtils
+from feature_splatting.utils.viewer import GlobalRegistry
+from feature_splatting.utils.viewer.viewer_elements import ViserServerBackdoor
+from feature_splatting.db import GaussianSimilaritySearchWrapper, SearchResult
 try:
     from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
     from gsplat.rendering import rasterization
@@ -56,6 +72,11 @@ class FeatureSplattingModelConfig(SplatfactoModelConfig):
     feat_latent_dim: int = 13
     # Feature Field MLP Head
     mlp_hidden_dim: int = 64
+    # mesh collection related stuff
+    db_path: str = "/vol/isy-rl/dtrofimov/data/databases/milvus"
+    db_name: str = "objaverse-gauss.db"
+    db_collection_name: str = "subset_788_fsp_clip"
+    meshes_path: str = "/vol/isy-rl/dtrofimov/data/objaverse-downloads/hf-objaverse-v1/glbs"
 
 def cosine_loss(network_output, gt):
     assert network_output.shape == gt.shape
@@ -79,11 +100,19 @@ class FeatureSplattingModel(SplatfactoModel):
         self.gauss_params["distill_features"] = distill_features
         self.main_feature_name = self.kwargs["metadata"]["main_feature_name"]
         self.main_feature_shape_chw = self.kwargs["metadata"]["feature_dim_dict"][self.main_feature_name]
+        self.data_dir: Path = self.kwargs["metadata"]["data_dir"]
 
         # Initialize the multi-head feature MLP
         self.feature_mlp = two_layer_mlp(self.config.feat_latent_dim,
                                          self.config.mlp_hidden_dim,
                                          self.kwargs["metadata"]["feature_dim_dict"])
+        
+        #Mesh controller
+        self._mesh_controller: Optional[MeshController] = None
+        self._vector_database: GaussianSimilaritySearchWrapper = GaussianSimilaritySearchWrapper(uri=self.db_pathname)
+        self._choosen_gs_indices: np.ndarray = np.array([])
+        self._current_ss_results: List[SearchResult] = []
+        self._editors_lock = threading.Lock()
         
         # Visualization utils
         self.maybe_populate_text_encoder()
@@ -137,27 +166,73 @@ class FeatureSplattingModel(SplatfactoModel):
             self.bbox_min_offset_vec = ViewerVec3("BBox Min", default_value=(0, 0, 0), disabled=True, visible=False)
             self.bbox_max_offset_vec = ViewerVec3("BBox Max", default_value=(0, 0, 0), disabled=True, visible=False)
             self.main_obj_only_checkbox = ViewerCheckbox("View main object only", default_value=True, disabled=True, visible=False)
+            self.background_only = ViewerCheckbox("Delete main object from view", default_value=False, disabled=True, visible=False)
+            self.main_obj_save_indices = ViewerButton("Save indices", cb_hook=lambda _: self.save_segmented_indices(self.segment_positive_obj(), self.segmented_indices_path), disabled=True, visible=False)
+            self.save_gaussian_lang_feats = ViewerCheckbox("Save Gaussian language features", default_value=False, disabled=False, visible=True)
             # Basic editing
             self.translation_vec = ViewerVec3("Translation", default_value=(0, 0, 0), disabled=True, visible=False)
             self.yaw_rotation = ViewerNumber("Yaw-only Rotation (deg)", default_value=0., disabled=True, visible=False)
             # Physics simulation
             self.physics_sim_checkbox = ViewerCheckbox("Physics Simulation", default_value=False, disabled=True, visible=False)
             self.physics_sim_step_btn = ViewerButton("Physics Simulation Step", disabled=True, visible=False, cb_hook=lambda _: self.physics_sim_step())
-    
+
+            # ===== ViserServer Backdoor + Meshes =====
+            self.backdoor = ViserServerBackdoor()
+            self.similarity_search_btn = ViewerButton("Similarity Search", cb_hook=lambda _: self.similarity_search(self._choosen_gs_indices), disabled=True, visible=False)
+            # TODO: add hook
+            self.found_meshes_dropdown = ViewerDropdown("Mesh results", default_value="", options=[""], disabled=True, visible=False, cb_hook=self.on_dropdown_choice)
+            self.mesh_addition_mode = ViewerDropdown("Mesh addition mode", options=list(map(lambda mode: mode.value, list(MeshSelectionMode))), default_value=MeshSelectionMode.REPLACE.value, disabled=True, visible=False)
+            self.mesh_translation_vec = ViewerVec3("Mesh translation", default_value=(0, 0, 0), disabled=True, visible=False, cb_hook=lambda vec: self.mesh_controller.translate_chosen_mesh(vec.value))
+            self.delete_mesh_btn = ViewerButton("Delete selected mesh", cb_hook=lambda _: self.mesh_controller.delete_selected_mesh(), disabled=True, visible=False)
+            
+    def on_dropdown_choice(self, element: ViewerDropdown) -> None:
+        with self._editors_lock:
+            segmented_means = self.means[self._choosen_gs_indices].detach().cpu()
+            mesh_data = MeshData.from_search_result(
+                    list(filter(lambda search_res: str(search_res) == element.value, self._current_ss_results))[0], # HINT: always should be only one entry that equals, otherwise something went wrong
+                    transform=torch.from_numpy(to_homogenous(self.ground_R, segmented_means.mean(dim=0))),#MeshData.transform_from_position(self.gaussian_editor.bbox_mean),#MeshData.transform_from_position(self.means[self._choosen_gs_indices].mean(dim=0).detach()), # mean of the object is at the mean of the GS blob
+                    visible=True
+                )
+            mesh_data.fit_bbox(get_bbox_min_max(segmented_means))
+            self.mesh_controller.add_mesh_data(mesh_data, mode=MeshSelectionMode(self.mesh_addition_mode.value))
+            self.mesh_translation_vec.set_disabled(False)
+            self.mesh_translation_vec.set_visible(True)
+            # set translation values to 0
+            self.mesh_translation_vec.value = np.zeros((3,), dtype=float)
+            # delete button show
+            self.delete_mesh_btn.set_disabled(False)
+            self.delete_mesh_btn.set_visible(True)
+
     def physics_sim_step(self):
         # It's just a placeholder now. NS needs some user interaction to send rendering requests.
         # So I make a button that does nothing but to trigger rendering.
         pass
     
     def estimate_ground(self):
-        selected_obj_idx, sample_idx = self.segment_gaussian('ground', use_canonical=True, threshold=0.5)
+        selected_obj_idx, sample_idx = self.segment_gaussian('ground', use_canonical=False, threshold=0.5)
         ground_means_xyz = self.means[sample_idx].detach().cpu().numpy()[selected_obj_idx]
-        self.ground_R, self.ground_T, ground_inliers = estimate_ground(ground_means_xyz)
+        self.ground_R, self.ground_T, ground_inliers = estimate_ground(ground_means_xyz, rotation_flip=True)
         self.gaussian_editor.register_ground_transform(self.ground_R, self.ground_T)
+        print(f"Ground R: {self.ground_R}; T: {self.ground_T}")
 
         # Enable next step
         self.segment_main_obj_btn.set_disabled(False)
         self.segment_main_obj_btn.set_visible(True)
+
+        # TODO: delete after the debugging
+        # Get the boolean flag of selected particles (of all particles)
+        """subset_idx = np.zeros(self.means.shape[0], dtype=bool)
+        subset_idx[sample_idx[selected_obj_idx]] = True
+        with self._editors_lock:
+            self._choosen_gs_indices = subset_idx
+        print(f"Means shape: {self.means.shape}; chosen gs shape: {self._choosen_gs_indices.shape}")
+
+        ground_min, ground_max = get_ground_bbox_min_max(self.means.detach().cpu().numpy(), subset_idx, self.ground_R, self.ground_T)
+        self.gaussian_editor.register_object_minimax(ground_min, ground_max)
+
+        #TODO: delete after the debugging
+        self.main_obj_only_checkbox.set_disabled(False)
+        self.main_obj_only_checkbox.set_visible(True)"""
     
     def start_editing(self):
         self.estimate_ground_btn.set_disabled(False)
@@ -175,9 +250,9 @@ class FeatureSplattingModel(SplatfactoModel):
         subset_idx = np.zeros(self.means.shape[0], dtype=bool)
         subset_idx[sample_idx[selected_obj_idx]] = True
 
-        ground_min, ground_max = get_ground_bbox_min_max(all_xyz, subset_idx, self.ground_R, self.ground_T)
+        self.ground_min, self.ground_max = get_ground_bbox_min_max(all_xyz, subset_idx, self.ground_R, self.ground_T)
 
-        self.gaussian_editor.register_object_minimax(ground_min, ground_max)
+        self.gaussian_editor.register_object_minimax(self.ground_min, self.ground_max)
 
         # Enable bbox editing
         self.bbox_min_offset_vec.set_disabled(False)
@@ -186,6 +261,8 @@ class FeatureSplattingModel(SplatfactoModel):
         self.bbox_max_offset_vec.set_visible(True)
         self.main_obj_only_checkbox.set_disabled(False)
         self.main_obj_only_checkbox.set_visible(True)
+        self.background_only.set_disabled(False)
+        self.background_only.set_visible(True)
 
         # Enable basic editing utilities
         self.translation_vec.set_disabled(False)
@@ -198,6 +275,212 @@ class FeatureSplattingModel(SplatfactoModel):
         self.physics_sim_checkbox.set_visible(True)
         self.physics_sim_step_btn.set_disabled(False)
         self.physics_sim_step_btn.set_visible(True)
+
+        # Enable saving incides
+        self.main_obj_save_indices.set_disabled(False)
+        self.main_obj_save_indices.set_visible(True)
+
+        # Enable mesh similarity search
+        self.similarity_search_btn.set_disabled(False)
+        self.similarity_search_btn.set_visible(True)
+
+        with self._editors_lock:
+            self._choosen_gs_indices = subset_idx
+
+        # TODO: planes - delete after debugging
+        points_in_the_box_indicator = self.gaussian_editor.filter_particles_bbox(
+            means=self.means,
+            ground_R=torch.from_numpy(self.ground_R).float().cuda(),
+            ground_T=torch.from_numpy(self.ground_T).float().cuda(),
+            xyz_min=torch.tensor(self.ground_min - np.array(self.bbox_min_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
+            xyz_max=torch.tensor(self.ground_max + np.array(self.bbox_max_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
+        ) # Full shape
+        plane_model, inliers = estimate_plane(self.means[points_in_the_box_indicator].detach().cpu().numpy())
+        vertices, faces = MeshUtils.plane_mesh(plane_model, 4.0, 4.0)
+        mesh_plane = MeshSimpleData(mesh_id="plane", vertices=vertices, faces=faces)
+        mesh_plane.position = np.array([0., 0., inliers[:, 2].mean() * VISER_NERFSTUDIO_SCALE_RATIO], dtype=float)
+        self.mesh_controller.add_mesh_data(
+            mesh=mesh_plane,
+            mode=MeshSelectionMode.ADD
+        )
+        return subset_idx
+    
+    def segment_positive_obj_new(self):
+        # Downsample, compute object-text similarities
+        selected_obj_idx, sample_idx = self.segment_gaussian('positive', use_canonical=False)
+
+        all_xyz = self.means.detach().cpu().numpy()
+        selected_xyz = all_xyz[sample_idx]
+        # Cluster the selected gaussians
+        selected_obj_idx = cluster_instance(selected_xyz, selected_obj_idx)
+
+        # Get the boolean flag of selected particles (of all particles)
+        subset_idx = np.zeros(self.means.shape[0], dtype=bool)
+        subset_idx[sample_idx[selected_obj_idx]] = True
+
+        # [2,3] bbox_clustered
+        self.ground_min, self.ground_max = get_ground_bbox_min_max(all_xyz, subset_idx, self.ground_R, self.ground_T)
+
+        self.gaussian_editor.register_object_minimax(self.ground_min, self.ground_max)
+
+        # Enable bbox editing
+        self.bbox_min_offset_vec.set_disabled(False)
+        self.bbox_min_offset_vec.set_visible(True)
+        self.bbox_max_offset_vec.set_disabled(False)
+        self.bbox_max_offset_vec.set_visible(True)
+        self.main_obj_only_checkbox.set_disabled(False)
+        self.main_obj_only_checkbox.set_visible(True)
+        self.background_only.set_disabled(False)
+        self.background_only.set_visible(True)
+
+        # Enable basic editing utilities
+        self.translation_vec.set_disabled(False)
+        self.translation_vec.set_visible(True)
+        self.yaw_rotation.set_disabled(False)
+        self.yaw_rotation.set_visible(True)
+
+        # Enable physics simulation
+        self.physics_sim_checkbox.set_disabled(False)
+        self.physics_sim_checkbox.set_visible(True)
+        self.physics_sim_step_btn.set_disabled(False)
+        self.physics_sim_step_btn.set_visible(True)
+
+        # Enable saving incides
+        self.main_obj_save_indices.set_disabled(False)
+        self.main_obj_save_indices.set_visible(True)
+
+        # Enable mesh similarity search
+        self.similarity_search_btn.set_disabled(False)
+        self.similarity_search_btn.set_visible(True)
+
+        with self._editors_lock:
+            self._choosen_gs_indices = subset_idx
+
+        # TODO: planes - delete after debugging
+        points_in_the_box_indicator = self.gaussian_editor.filter_particles_bbox(
+            means=self.means,
+            ground_R=torch.from_numpy(self.ground_R).float().cuda(),
+            ground_T=torch.from_numpy(self.ground_T).float().cuda(),
+            xyz_min=torch.tensor(self.ground_min - np.array(self.bbox_min_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
+            xyz_max=torch.tensor(self.ground_max + np.array(self.bbox_max_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
+        ) # Full shape
+        bounded_xyz_cuda = self.means[points_in_the_box_indicator]
+        bounded_features = self.distill_features[points_in_the_box_indicator]
+
+
+        """plane_model, inliers = estimate_plane(self.means[points_in_the_box_indicator].detach().cpu().numpy())
+        vertices, faces = MeshUtils.plane_mesh(plane_model, 4.0, 4.0)
+        mesh_plane = MeshSimpleData(mesh_id="plane", vertices=vertices, faces=faces)
+        mesh_plane.position = np.array([0., 0., inliers[:, 2].mean() * VISER_NERFSTUDIO_SCALE_RATIO], dtype=float)
+        self.mesh_controller.add_mesh_data(
+            mesh=mesh_plane,
+            mode=MeshSelectionMode.ADD
+        )"""
+
+        #TODO: better selection
+        # Multi-class similarity
+        fg_mask_subset_idx = self.multi_class_similarity(points_in_the_box_indicator, use_canonical=False) # Full [self.means.shape]
+        bounded_xyz_cuda = self.means[fg_mask_subset_idx]
+        # Inward selection: TODO - add boundary?
+        fg_mask_box = self.gaussian_editor.filter_particles_bbox(
+            means=self.means[fg_mask_subset_idx],
+            ground_R=torch.from_numpy(self.ground_R).float().cuda(),
+            ground_T=torch.from_numpy(self.ground_T).float().cuda(),
+            xyz_min=torch.tensor(self.ground_min - np.array(self.bbox_min_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
+            xyz_max=torch.tensor(self.ground_max + np.array(self.bbox_max_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
+        ) # Partial [fg_mask_subset_idx == True] shape 
+        fg_mask_box_subset_idx = np.zeros(self.means.shape[0], dtype=bool)
+        fg_mask_box_subset_idx[fg_mask_subset_idx] = fg_mask_box.detach().cpu().numpy()
+        assert fg_mask_subset_idx.shape == fg_mask_box_subset_idx.shape
+        fgm_mask_final = torch.logical_or(fg_mask_subset_idx, fg_mask_box_subset_idx) # Full [self.means.shape]
+        
+
+
+
+
+        return subset_idx
+    
+    def multi_class_similarity(self, subset_idx: np.ndarray, use_canonical: bool = False) -> np.ndarray:
+        """
+        1. Computes text embeddings for the background and foreground objects
+        2. Inferences the features for the subset of points
+        3. Computes the cosine similarity between the text embeddings and the features
+        4. Mark points as foreground if they are more similar to fg words than the first len(bj_obj_list) prompts
+        ---
+        Returns: np.ndarray of shape self.means.shape[0] with boolean flags of selected gaussians
+        """
+        # 1. Compute text embeddings
+        keys = ["negative" if not use_canonical else "canonical", "positive"]
+        bg_fg_embeddings = self.viewer_utils.get_wordwise_embeddings(keys) # [n, emb_dim]
+        words_sizes = self.viewer_utils.get_key_word_sizes(keys) # [2] = [bg_size, fg_size]: bg_size + fg_size = n
+        # 2. Inference features
+        clip_feature_mc = self.feature_mlp.per_gaussian_forward(self.distill_features[subset_idx])[self.main_feature_name]
+        clip_feature_mc /= clip_feature_mc.norm(dim=1, keepdim=True)
+        # 3. Compute similarity
+        similarity_nm = torch.einsum("nc,mc->nm", bg_fg_embeddings, clip_feature_mc)
+        # 4. Mark points as foreground if they are more similar to fg words than the first len(bj_obj_list) prompts
+        num_gb = words_sizes[0]
+        fg_mask = (similarity_nm.argmax(dim=0) > num_gb).cpu().numpy()
+        fg_mask_idx = np.zeros(subset_idx.shape[0], dtype=bool)
+        fg_mask_idx[subset_idx == True] = fg_mask
+        return fg_mask_idx
+    
+    def similarity_search(self, selected_obj_idx: np.ndarray):
+        # select the needed features by idxs
+        # TODO: check this agrees with how they sample in segment_gaussian, especially if sample_size is not none
+        sampled_features = self.distill_features
+        # latent space embeddings
+        # TODO: maybe the results will be better if we will take the points from the bbox and not that only responded
+        clip_emb_nc = self.feature_mlp.per_gaussian_forward(torch.mean(sampled_features[selected_obj_idx], dim=0, keepdim=True))[self.main_feature_name]
+        # [1, emb_size]
+        clip_emb_nc /= clip_emb_nc.norm(dim=1, keepdim=True)
+
+        # search
+        clip_vector_list = clip_emb_nc.cpu().numpy().tolist()
+        # TODO: always take only [0] entry for now since don't search for many objects at once
+        found_results: List[SearchResult] = self._vector_database.search_meshes(self.config.db_collection_name, data=clip_vector_list, limit=10)[0]
+        # set root for meshes for each results since result does not know where the meshes are located (TODO: fix it by adding this info to the database)
+        for result in found_results:
+            result.set_root(self.config.meshes_path)
+
+        # gui - make choice visible and update options in the dropdown
+        self.found_meshes_dropdown.set_disabled(False)
+        self.found_meshes_dropdown.set_visible(True)
+        self.found_meshes_dropdown.set_options(list(map(str, found_results)))
+
+        self.mesh_addition_mode.set_disabled(False)
+        self.mesh_addition_mode.set_visible(True)
+        # update current results to be able to access them afterwards
+        with self._editors_lock:
+            self._current_ss_results = found_results
+    
+    @property
+    def segmented_indices_path(self) -> Path:
+        return self.data_dir.joinpath(f"indices_{str(date.today())}.npy")
+    
+    @property
+    def segmented_gaussians_clip_features_path(self) -> Path:
+        return self.data_dir.joinpath(f"gauss_clip_feats_{str(date.today())}.pt")
+    
+    @property
+    def segmented_embedding_path(self) -> Path:
+        return self.data_dir.joinpath(f"gauss_clip_embedding_{str(date.today())}.pt")
+    
+    @property
+    def mesh_storage_path(self) -> Path:
+        return Path(self.config.meshes_path)
+    
+    @property
+    def db_pathname(self) -> str:
+        return os.path.join(self.config.db_path, self.config.db_name)
+    
+    @staticmethod
+    def save_segmented_indices(indices: np.ndarray, path: str):
+        np.save(path, indices)
+
+    def compute_similarity_one(self, field_name: str, distilled_features: torch.Tensor):
+        # TODO: write
+        pass
     
     def segment_gaussian(self, field_name : str, use_canonical : bool, sample_size : Optional[int] = 2**15, threshold : Optional[float] = 0.5):
         if "clip" not in self.main_feature_name.lower():
@@ -226,6 +509,15 @@ class FeatureSplattingModel(SplatfactoModel):
         # pos_sim /= pos_sim.max()
 
         selected_obj_idx = (pos_sim > threshold).cpu().numpy()
+
+        # save gaussians clip feature if activated
+        if self.save_gaussian_lang_feats.value:
+            torch.save(clip_feature_nc.cpu()[selected_obj_idx], self.segmented_gaussians_clip_features_path)
+            # latent space embedding
+            clip_emb_nc = self.feature_mlp.per_gaussian_forward(torch.mean(sampled_features[selected_obj_idx], dim=0, keepdim=True))[self.main_feature_name]
+            # [1, emb_size]
+            clip_emb_nc /= clip_emb_nc.norm(dim=1, keepdim=True)
+            torch.save(clip_emb_nc.cpu(), self.segmented_embedding_path)
 
         return selected_obj_idx, sample_idx
 
@@ -384,11 +676,11 @@ class FeatureSplattingModel(SplatfactoModel):
             batch['feature_dict'][k] = batch['feature_dict'][k].to(self.device)
         decoded_feature_dict = self.decode_features(outputs["feature"])
         feature_loss = torch.tensor(0.0, device=self.device)
-        for key, target_feat in batch['feature_dict'].items():
+        for key, target_feat in batch['feature_dict'].items(): # we get the batch from FeatureSplattingDataManager.next_eval
             cur_loss_weight = 1.0 if key == self.main_feature_name else self.config.feat_aux_loss_weight
-            ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
-            target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask]
-            feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
+            ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0]) # True/False for each patch [W_p, H_p]
+            target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask] # replace the ignored features with the decoded features for them to not influence the loss
+            feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight # get cosine similarities across the embeddings for each patch and average them (in cosine_loss)
         loss_dict["feature_loss"] = self.config.feat_loss_weight * feature_loss
         return loss_dict
     
@@ -402,9 +694,12 @@ class FeatureSplattingModel(SplatfactoModel):
             # Editing mode
             self.gaussian_editor.pre_rendering_process(self.means, self.opacities, self.scales, self.quats,
                                                        editing_dict=editing_dict,
-                                                       min_offset=torch.tensor(self.bbox_min_offset_vec.value).float().cuda() / 10.0,
-                                                       max_offset=torch.tensor(self.bbox_max_offset_vec.value).float().cuda() / 10.0,
-                                                       view_main_obj_only=self.main_obj_only_checkbox.value)
+                                                       min_offset=torch.tensor(self.bbox_min_offset_vec.value).float().cuda() / VISER_NERFSTUDIO_SCALE_RATIO,
+                                                       max_offset=torch.tensor(self.bbox_max_offset_vec.value).float().cuda() / VISER_NERFSTUDIO_SCALE_RATIO,
+                                                       view_main_obj_only=self.main_obj_only_checkbox.value,
+                                                       delete_main_obj=self.background_only.value,
+                                                       chosen_gs_indices=self._choosen_gs_indices
+                                                       )
         outs = super().get_outputs_for_camera(camera, obb_box)
         if self.edit_checkbox.value:
             self.gaussian_editor.post_rendering_process(self.means, self.opacities, self.quats, self.scales)
@@ -443,6 +738,16 @@ class FeatureSplattingModel(SplatfactoModel):
                 outs["similarity"] = F.interpolate(out_sim, size=outs["rgb"].shape[:2], mode="bilinear", align_corners=False).squeeze()
                 outs["similarity"] = outs["similarity"][:, :, None]
         return outs
+    
+    # ===== Utils functions for managing meshes =====
+    @cached_property
+    def mesh_controller(self) -> MeshController:
+        if self._mesh_controller is None:
+            assert GlobalRegistry.viser_server is not None, "ViserServer not set in GlobalRegistry"
+            self._mesh_controller = MeshController(GlobalRegistry.viser_server)
+            return self._mesh_controller
+        else:
+            return self._mesh_controller
     
     # ===== Utils functions for managing the gaussians =====
 
