@@ -42,7 +42,9 @@ from feature_splatting.utils import (
     get_ground_bbox_min_max,
     gaussian_editor,
     to_homogenous,
-    get_bbox_min_max
+    get_bbox_min_max,
+    remove_ground,
+    ground_bbox_filter
 )
 from feature_splatting.utils.viewer import MeshController, MeshData, MeshSimpleData, MeshSelectionMode, MeshUtils
 from feature_splatting.utils.viewer import GlobalRegistry
@@ -162,7 +164,7 @@ class FeatureSplattingModel(SplatfactoModel):
             # Ground estimation
             self.estimate_ground_btn = ViewerButton("Estimate Ground", cb_hook=lambda _: self.estimate_ground(), disabled=True, visible=False)
             # Main object segmentation
-            self.segment_main_obj_btn = ViewerButton("Segment main obj", cb_hook=lambda _: self.segment_positive_obj(), disabled=True, visible=False)
+            self.segment_main_obj_btn = ViewerButton("Segment main obj", cb_hook=lambda _: self.segment_positive_obj_new(), disabled=True, visible=False)
             self.bbox_min_offset_vec = ViewerVec3("BBox Min", default_value=(0, 0, 0), disabled=True, visible=False)
             self.bbox_max_offset_vec = ViewerVec3("BBox Max", default_value=(0, 0, 0), disabled=True, visible=False)
             self.main_obj_only_checkbox = ViewerCheckbox("View main object only", default_value=True, disabled=True, visible=False)
@@ -184,6 +186,72 @@ class FeatureSplattingModel(SplatfactoModel):
             self.mesh_addition_mode = ViewerDropdown("Mesh addition mode", options=list(map(lambda mode: mode.value, list(MeshSelectionMode))), default_value=MeshSelectionMode.REPLACE.value, disabled=True, visible=False)
             self.mesh_translation_vec = ViewerVec3("Mesh translation", default_value=(0, 0, 0), disabled=True, visible=False, cb_hook=lambda vec: self.mesh_controller.translate_chosen_mesh(vec.value))
             self.delete_mesh_btn = ViewerButton("Delete selected mesh", cb_hook=lambda _: self.mesh_controller.delete_selected_mesh(), disabled=True, visible=False)
+
+            # Parameters for debugging TODO delete
+            self.threshold = ViewerNumber(
+                name="Threshold",
+                default_value=0.7,
+                disabled=True,
+                visible=False
+            )
+            self.clustering_k = ViewerNumber(
+                name="Clustering min samples",
+                default_value=100,
+                disabled=True,
+                visible=False
+            )
+            self.clustering_eps = ViewerNumber(
+                name="Clustering eps",
+                default_value=0.1,
+                disabled=True,
+                visible=False
+            )
+            self.bbox_inward_eps = ViewerNumber(
+                name="Inward bbox eps",
+                default_value=0.10,
+                disabled=True,
+                visible=False
+            )
+            self.knn_pos_ratio = ViewerNumber(
+                name="KNN positive ratio",
+                default_value=0.5,
+                disabled=True,
+                visible=False
+            )
+            self.knn_k = ViewerNumber(
+                name="KNN k",
+                default_value=20,
+                disabled=True,
+                visible=False
+            )
+            self.knn_iters = ViewerNumber(
+                name="KNN iters",
+                default_value=1,
+                disabled=True,
+                visible=False
+            )
+
+    def debugging(self, activate=True):
+        self.threshold.set_disabled(not activate)
+        self.threshold.set_visible(activate)
+
+        self.clustering_k.set_disabled(not activate)
+        self.clustering_k.set_visible(activate)
+
+        self.clustering_eps.set_disabled(not activate)
+        self.clustering_eps.set_visible(activate)
+
+        self.bbox_inward_eps.set_disabled(not activate)
+        self.bbox_inward_eps.set_visible(activate)
+
+        self.knn_pos_ratio.set_disabled(not activate)
+        self.knn_pos_ratio.set_visible(activate)
+
+        self.knn_k.set_disabled(not activate)
+        self.knn_k.set_visible(activate)
+
+        self.knn_iters.set_disabled(not activate)
+        self.knn_iters.set_visible(activate)
             
     def on_dropdown_choice(self, element: ViewerDropdown) -> None:
         with self._editors_lock:
@@ -288,7 +356,7 @@ class FeatureSplattingModel(SplatfactoModel):
             self._choosen_gs_indices = subset_idx
 
         # TODO: planes - delete after debugging
-        points_in_the_box_indicator = self.gaussian_editor.filter_particles_bbox(
+        points_in_the_box_indicator = self.gaussian_editor.ground_bbox_filter(
             means=self.means,
             ground_R=torch.from_numpy(self.ground_R).float().cuda(),
             ground_T=torch.from_numpy(self.ground_T).float().cuda(),
@@ -305,7 +373,9 @@ class FeatureSplattingModel(SplatfactoModel):
         )
         return subset_idx
     
+    @torch.no_grad()
     def segment_positive_obj_new(self):
+        """fast_compute_rough_bbox"""
         # Downsample, compute object-text similarities
         selected_obj_idx, sample_idx = self.segment_gaussian('positive', use_canonical=False)
 
@@ -322,6 +392,7 @@ class FeatureSplattingModel(SplatfactoModel):
         self.ground_min, self.ground_max = get_ground_bbox_min_max(all_xyz, subset_idx, self.ground_R, self.ground_T)
 
         self.gaussian_editor.register_object_minimax(self.ground_min, self.ground_max)
+        """end fast_compute_rough_bbox"""
 
         # Enable bbox editing
         self.bbox_min_offset_vec.set_disabled(False)
@@ -353,20 +424,58 @@ class FeatureSplattingModel(SplatfactoModel):
         self.similarity_search_btn.set_disabled(False)
         self.similarity_search_btn.set_visible(True)
 
-        with self._editors_lock:
-            self._choosen_gs_indices = subset_idx
+        self.debugging(True)
+
+        current_idx = torch.arange(self.means.shape[0]).to(self.device)
+        positive_obj_idx = torch.from_numpy(subset_idx).to(self.device).bool()
 
         # TODO: planes - delete after debugging
-        points_in_the_box_indicator = self.gaussian_editor.filter_particles_bbox(
-            means=self.means,
+        """bounded_xyz 1"""
+        bounded_xyz = self.means @ torch.from_numpy(self.ground_R).float().cuda().T
+        bounded_xyz += torch.from_numpy(self.ground_T).float().cuda()
+        xyz_min = torch.tensor(self.ground_min - np.array(self.bbox_min_offset_vec.value)).float().cuda()
+        xyz_max = torch.tensor(self.ground_max + np.array(self.bbox_max_offset_vec.value)).float().cuda()
+        fg_obj_bbox = torch.stack([xyz_min, xyz_max], dim=0)
+        within_bbox = ((bounded_xyz[:, 0] > fg_obj_bbox[0, 0]) & (bounded_xyz[:, 0] < fg_obj_bbox[1, 0])) & \
+                    ((bounded_xyz[:, 1] > fg_obj_bbox[0, 1]) & (bounded_xyz[:, 1] < fg_obj_bbox[1, 1])) & \
+                    ((bounded_xyz[:, 2] > fg_obj_bbox[0, 2]) & (bounded_xyz[:, 2] < fg_obj_bbox[1, 2]))
+        bounded_xyz_cuda = self.means[within_bbox] # or bounded_xyz??? which is in ground CS
+        bounded_features = self.distill_features[within_bbox]
+        current_idx = torch.arange(self.means.shape[0]).to(self.device)[within_bbox]
+        fg_obj_similarity = self.compute_similarity_one(
+            field_name="positive",
+            distilled_features=bounded_features,
+            use_canonical=True
+        )
+        fg_obj_idx = fg_obj_similarity > self.threshold.value
+        selected_obj_idx = fg_obj_idx
+
+        """Second clustering step"""
+        selected_obj_idx = cluster_instance(
+            bounded_xyz_cuda.detach().cpu().numpy(),
+            selected_obj_idx.detach().cpu().numpy(),
+            min_sample=self.clustering_k.value,
+            eps=self.clustering_eps.value
+        )
+        """Ground estimation: already done before by finding R|T"""
+
+        """A bounding box that selects the objects with some noisy outer particles"""
+        selected_obj_idx = ground_bbox_filter(
+            all_xyz_n3=bounded_xyz_cuda,
+            selected_obj_idx=torch.from_numpy(selected_obj_idx).cuda(),
             ground_R=torch.from_numpy(self.ground_R).float().cuda(),
             ground_T=torch.from_numpy(self.ground_T).float().cuda(),
-            xyz_min=torch.tensor(self.ground_min - np.array(self.bbox_min_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
-            xyz_max=torch.tensor(self.ground_max + np.array(self.bbox_max_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
-        ) # Full shape
-        bounded_xyz_cuda = self.means[points_in_the_box_indicator]
-        bounded_features = self.distill_features[points_in_the_box_indicator]
+            boundary=torch.tensor([self.bbox_inward_eps.value] * 3).float().cuda()
+        )
+        positive_obj_idx = selected_obj_idx # On this step it works fine, quolity depends on bbox_inward_eps
 
+        # Refine it
+        bounded_xyz_cuda = bounded_xyz_cuda[selected_obj_idx]
+        bounded_xyz_np = bounded_xyz_cuda.detach().cpu().numpy()
+        bounded_features = bounded_features[selected_obj_idx]
+        current_idx = current_idx[selected_obj_idx]
+
+        #positive_obj_idx = torch.ones_like(current_idx).bool().cuda()
 
         """plane_model, inliers = estimate_plane(self.means[points_in_the_box_indicator].detach().cpu().numpy())
         vertices, faces = MeshUtils.plane_mesh(plane_model, 4.0, 4.0)
@@ -377,30 +486,70 @@ class FeatureSplattingModel(SplatfactoModel):
             mode=MeshSelectionMode.ADD
         )"""
 
-        #TODO: better selection
-        # Multi-class similarity
-        fg_mask_subset_idx = self.multi_class_similarity(points_in_the_box_indicator, use_canonical=False) # Full [self.means.shape]
-        bounded_xyz_cuda = self.means[fg_mask_subset_idx]
+        """ Multi-class similarity """
+        # fg_mask_subset_idx = positive_obj_idx
+        fg_mask_subset_idx = self.multi_class_similarity(bounded_features, use_canonical=False)
+        print(f"fg_mask_subset_idx shape: {fg_mask_subset_idx.shape}")
+        assert fg_mask_subset_idx.shape[0] == bounded_xyz_cuda.shape[0], "Shapes should be the same. Were: {} and {}".format(fg_mask_subset_idx.shape, bounded_xyz_cuda.shape[0])
         # Inward selection: TODO - add boundary?
-        fg_mask_box = self.gaussian_editor.filter_particles_bbox(
-            means=self.means[fg_mask_subset_idx],
+        fg_mask_box = ground_bbox_filter(
+            all_xyz_n3=bounded_xyz_cuda,
+            selected_obj_idx=torch.from_numpy(fg_mask_subset_idx).cuda(),
             ground_R=torch.from_numpy(self.ground_R).float().cuda(),
             ground_T=torch.from_numpy(self.ground_T).float().cuda(),
-            xyz_min=torch.tensor(self.ground_min - np.array(self.bbox_min_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
-            xyz_max=torch.tensor(self.ground_max + np.array(self.bbox_max_offset_vec.value) / VISER_NERFSTUDIO_SCALE_RATIO).float().cuda(),
-        ) # Partial [fg_mask_subset_idx == True] shape 
-        fg_mask_box_subset_idx = np.zeros(self.means.shape[0], dtype=bool)
-        fg_mask_box_subset_idx[fg_mask_subset_idx] = fg_mask_box.detach().cpu().numpy()
-        assert fg_mask_subset_idx.shape == fg_mask_box_subset_idx.shape
-        fgm_mask_final = torch.logical_or(fg_mask_subset_idx, fg_mask_box_subset_idx) # Full [self.means.shape]
+            boundary=torch.tensor([self.bbox_inward_eps.value] * 3).float().cuda()
+        )
+        assert fg_mask_box.shape == fg_mask_subset_idx.shape, "Shapes should be the same. Were: {} and {}".format(fg_mask_box.shape, fg_mask_subset_idx.shape)
+        assert fg_mask_box.shape[0] != 0, "No objects were found in the box"
+        positive_obj_idx = fg_mask_box
+
+        """Get particles on the periphery of the bbox (that is not close to other surfaces)"""
+        positive_obj_idx = knn_infilling(
+            bounded_xyz_cuda,
+            positive_obj_idx,
+            dilation_iters=self.knn_iters.value,
+            positive_ratio=self.knn_pos_ratio.value,
+            k=self.knn_k.value
+        )
+        positive_obj_idx = remove_ground(
+            bounded_xyz_cuda,
+            positive_obj_idx,
+            torch.from_numpy(self.ground_R).float().cuda(),
+            torch.from_numpy(self.ground_T).float().cuda(),
+            ground_level=self.ground_min[1] #0
+        )
+        non_fg_obj_idx = ~positive_obj_idx
+        non_fg_obj_idx = knn_infilling(
+            bounded_xyz_cuda,
+            non_fg_obj_idx,
+            dilation_iters=1,
+            positive_ratio=0.5,
+            k=20
+        )
+        positive_obj_idx = ~non_fg_obj_idx
+
+        """ Final clustering; use 10% as minimum object distance """
+        # TODO: should be under a flag if needed
+        final_noise_filtering = True
+        if final_noise_filtering:
+            guessed_eps = np.mean(bounded_xyz_np.max(axis=0) - bounded_xyz_np.min(axis=0)) / 10
+            print(f"Guessed eps: {guessed_eps}")
+            positive_obj_idx = cluster_instance(
+                bounded_xyz_np,
+                positive_obj_idx.detach().cpu().numpy(),
+                eps=guessed_eps,
+                min_sample=self.clustering_k.value,
+            )
+            positive_obj_idx = torch.from_numpy(positive_obj_idx).to(self.device).bool()
+        final_obj_flag = np.zeros(self.means.shape[0], dtype=bool)
+        final_obj_flag[current_idx.cpu().numpy()] = positive_obj_idx.detach().cpu().numpy()
+
+        with self._editors_lock:
+            self._choosen_gs_indices = final_obj_flag
         
-
-
-
-
-        return subset_idx
+        return final_obj_flag
     
-    def multi_class_similarity(self, subset_idx: np.ndarray, use_canonical: bool = False) -> np.ndarray:
+    def multi_class_similarity(self, bounded_features: torch.Tensor, use_canonical: bool = False) -> np.ndarray:
         """
         1. Computes text embeddings for the background and foreground objects
         2. Inferences the features for the subset of points
@@ -414,16 +563,15 @@ class FeatureSplattingModel(SplatfactoModel):
         bg_fg_embeddings = self.viewer_utils.get_wordwise_embeddings(keys) # [n, emb_dim]
         words_sizes = self.viewer_utils.get_key_word_sizes(keys) # [2] = [bg_size, fg_size]: bg_size + fg_size = n
         # 2. Inference features
-        clip_feature_mc = self.feature_mlp.per_gaussian_forward(self.distill_features[subset_idx])[self.main_feature_name]
+        clip_feature_mc = self.feature_mlp.per_gaussian_forward(bounded_features)[self.main_feature_name]
         clip_feature_mc /= clip_feature_mc.norm(dim=1, keepdim=True)
         # 3. Compute similarity
         similarity_nm = torch.einsum("nc,mc->nm", bg_fg_embeddings, clip_feature_mc)
         # 4. Mark points as foreground if they are more similar to fg words than the first len(bj_obj_list) prompts
         num_gb = words_sizes[0]
-        fg_mask = (similarity_nm.argmax(dim=0) > num_gb).cpu().numpy()
-        fg_mask_idx = np.zeros(subset_idx.shape[0], dtype=bool)
-        fg_mask_idx[subset_idx == True] = fg_mask
-        return fg_mask_idx
+        fg_mask = (similarity_nm.argmax(dim=0) >= num_gb).cpu().numpy()
+        assert fg_mask.any().item(), "No objects were found"
+        return fg_mask
     
     def similarity_search(self, selected_obj_idx: np.ndarray):
         # select the needed features by idxs
@@ -478,15 +626,47 @@ class FeatureSplattingModel(SplatfactoModel):
     def save_segmented_indices(indices: np.ndarray, path: str):
         np.save(path, indices)
 
-    def compute_similarity_one(self, field_name: str, distilled_features: torch.Tensor):
-        # TODO: write
-        pass
+    def compute_similarity_one(
+            self,
+            field_name: str,
+            distilled_features: torch.Tensor,
+            chunk_size: int = 2**18,
+            use_canonical: bool = True,
+            ) -> torch.Tensor:
+        """
+
+        """
+        # 1. Compute text embeddings for the canonical + positive words
+        keys = ["negative" if not use_canonical else "canonical", field_name]
+        text_embs = self.viewer_utils.get_wordwise_embeddings(keys) # [m, emb_dim]; m = len(keys)
+        neg_k, pos_l = self.viewer_utils.get_key_word_sizes(keys) # [k, l] k + l = m
+        # 2. Compute similarities between the text embeddings and the gaussian features
+        num_chunks = int(np.ceil(distilled_features.shape[0] / chunk_size))
+        similarity_nm = []
+        for i in range(num_chunks):
+            chunk = distilled_features[i * chunk_size: (i + 1) * chunk_size].to(self.device)
+            clip_feature_mc = self.feature_mlp.per_gaussian_forward(chunk)[self.main_feature_name]
+            clip_feature_mc /= clip_feature_mc.norm(dim=1, keepdim=True) + 1e-6 # eps
+            chunk_similarity = clip_feature_mc @ text_embs.T # [n, m]
+            similarity_nm.append(chunk_similarity)
+        similarity_nm = torch.cat(similarity_nm, dim=0)
+
+        similarity_nm = similarity_nm / 0.05 # TODO: check this temerature scaling works
+        normalized_sim = similarity_nm.softmax(dim=1)[:, -pos_l:].sum(dim=1) # sum over the positive words similarities
+        assert torch.isnan(normalized_sim).sum() == 0, "NaNs in the similarity vector"
+
+        normalized_sim = normalized_sim.flatten()
+        normalized_sim -= normalized_sim.min()
+        normalized_sim /= normalized_sim.max()
+        return normalized_sim
+
+
     
     def segment_gaussian(self, field_name : str, use_canonical : bool, sample_size : Optional[int] = 2**15, threshold : Optional[float] = 0.5):
         if "clip" not in self.main_feature_name.lower():
             return
         if sample_size is not None:
-            sample_size = min(2**15, self.means.shape[0])
+            sample_size = min(sample_size, self.means.shape[0])
             sample_idx = torch.randperm(self.means.shape[0])[:sample_size]
             sampled_features = self.distill_features[sample_idx]
         else:
