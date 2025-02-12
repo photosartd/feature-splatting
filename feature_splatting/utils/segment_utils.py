@@ -108,17 +108,77 @@ def get_bbox_min_max(particles: torch.Tensor) -> torch.Tensor:
     )
 
 def knn_infilling(all_xyz_n3: torch.Tensor, obj_idx, k=50, dilation_iters=3, positive_ratio=0.8):
-    obj_idx = obj_idx.copy()
+    obj_idx = obj_idx.clone()
     for _ in range(dilation_iters):
+        # Get non-object points
         non_fg_xyz = all_xyz_n3[~obj_idx]
-        dists_nk, indices_nk = knn_points(all_xyz_n3[obj_idx][None], non_fg_xyz[None], K=k)
+        non_fg_indices = torch.nonzero(~obj_idx, as_tuple=False).squeeze(1)  # Indices of non-object points
+        object_subset_indices = torch.nonzero(obj_idx, as_tuple=False).squeeze(1)
+        
+        # Check if there are non-object points left
+        if non_fg_indices.numel() == 0 or not len(object_subset_indices):
+            print("No non-object points left to process.")
+            break
+        
+        # Perform KNN search
+        dists_nk, indices_nk, _ = knn_points(all_xyz_n3[~obj_idx][None], all_xyz_n3[obj_idx][None], K=k)
         dists_nk = dists_nk.squeeze(0)
         indices_nk = indices_nk.squeeze(0)
-        positive_cnt = obj_idx[indices_nk].sum(axis=1) # for any point - how many of its neighbors are positive (relate to the object)
-        non_fg_indices = torch.arange(all_xyz_n3.shape[0])[~obj_idx] # indices of non-fg points
-        non_fg_indices = non_fg_indices[positive_cnt > int(k * positive_ratio)] # select points that have enough positive neighbors
-        obj_idx[non_fg_indices] = True # dilate the object
+
+        # Convert local indices to global indices
+        global_indices_nk = object_subset_indices[indices_nk]
+
+        # Count the number of positive neighbors
+        positive_cnt = obj_idx[global_indices_nk].sum(dim=1)  # Count positive neighbors
+        
+        # Select non-object points with sufficient positive neighbors
+        print(positive_cnt)
+        eligible_mask = positive_cnt > int(k * positive_ratio)
+        eligible_indices = non_fg_indices[eligible_mask]
+        
+        # -- Count how many are transitioning from False to True --
+        old_positives = (obj_idx == True).sum().item()
+        new_positives = (obj_idx[eligible_indices] == False).sum().item()
+        print(f"Number of newly activated knn points this iteration: {new_positives}; percentage: {new_positives / old_positives}")
+        
+        # Update the object index mask
+        obj_idx[eligible_indices] = True  # Dilate the object
+    
     return obj_idx
 
+def remove_ground(all_xyz_n3, selected_obj_idx, ground_R, ground_T, ground_level=0):
+    """
+    Remove points that are on the ground
+    Should work both for numpy and torch tensors
+    """
+    particles = all_xyz_n3 @ ground_R.T # translates and rotates points to the ground CS
+    particles += ground_T
+    non_ground_idx = particles[:, 1] > ground_level
+    return selected_obj_idx & non_ground_idx
 
-
+def ground_bbox_filter(all_xyz_n3, selected_obj_idx, ground_R, ground_T, boundary):
+    """Filters points within a bounding box on the ground
+    Should be working both for numpy and torch tensors
+    """
+    particles = all_xyz_n3 @ ground_R.T
+    particles += ground_T
+    assert particles.shape[0] == selected_obj_idx.shape[0], f"{particles.shape[0]} != {selected_obj_idx.shape[0]}"
+    selected_particles = particles[selected_obj_idx]
+    print(f"selected_particles: {selected_particles.shape}")
+    if hasattr(selected_particles, 'min'):  # PyTorch
+        xyz_min = selected_particles.min(dim=0).values
+        xyz_max = selected_particles.max(dim=0).values
+        bbox_extent = xyz_max - xyz_min
+        bbox_diagonal = torch.norm(bbox_extent)
+    else:  # NumPy
+        xyz_min = np.min(selected_particles, axis=0)
+        xyz_max = np.max(selected_particles, axis=0)
+        bbox_extent = xyz_max - xyz_min
+        bbox_diagonal = np.linalg.norm(bbox_extent)
+    xyz_min += (boundary * bbox_diagonal)
+    xyz_max -= (boundary * bbox_diagonal)
+    bbox_particles_idx = ((particles > xyz_min) & (particles < xyz_max)).all(dim=1 if hasattr(particles, 'dim') else 1)
+    assert bbox_particles_idx.shape[0] == selected_obj_idx.shape[0]
+    bbox_selected_particles = bbox_particles_idx | selected_obj_idx
+    bbox_selected_particles = bbox_selected_particles.bool() if isinstance(bbox_selected_particles, torch.Tensor) else bbox_selected_particles.astype(bool)
+    return bbox_selected_particles

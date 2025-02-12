@@ -158,9 +158,9 @@ if __name__ == "__main__":
     db_name = "objaverse-gauss.db"
     db_pathname = os.path.join(db_path, db_name)
     clip_model_name = "ViT-L/14@336px"
-    collection_name = "subset_788_fsp_clip2"
+    collection_name = "subset_10k_fsp_clip"
     
-    with open("/vol/isy-rl/dtrofimov/projects/langs/lanGS/notebooks/sampled_classes.json", "r") as f:
+    with open("/vol/isy-rl/dtrofimov/projects/langs/lanGS/notebooks/sampled_classes_january.json", "r") as f:
         sampled_classes = json.load(f)
 
     render_root = "/vol/isy-rl/dtrofimov/data/objaverse-renders/renders/"

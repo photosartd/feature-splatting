@@ -77,7 +77,7 @@ class FeatureSplattingModelConfig(SplatfactoModelConfig):
     # mesh collection related stuff
     db_path: str = "/vol/isy-rl/dtrofimov/data/databases/milvus"
     db_name: str = "objaverse-gauss.db"
-    db_collection_name: str = "subset_788_fsp_clip"
+    db_collection_name: str = "subset_10k_fsp_clip"
     meshes_path: str = "/vol/isy-rl/dtrofimov/data/objaverse-downloads/hf-objaverse-v1/glbs"
 
 def cosine_loss(network_output, gt):

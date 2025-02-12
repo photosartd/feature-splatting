@@ -41,7 +41,7 @@ class ViewerUtils:
         """
         embeds = []
         for word in words:
-            embed = self.text_encoding_func([word])
+            embed = self.text_encoding_func([word]).squeeze(0)
             embeds.append(embed)
         return torch.stack(embeds)
     
@@ -51,11 +51,11 @@ class ViewerUtils:
             name_key = [name_key]
         for key in name_key:
             if key in self.text_embedding_dict:
-                words = self.text_embedding_dict[name_key][0]
+                words = self.text_embedding_dict[key][0]
                 all_words.extend(words)
             else:
                 raise ValueError(f"Key {key} not found in text_embedding_dict")
-        return self.wordwise_embeddings(all_words)
+        return self.wordwise_embeddings(tuple(all_words))
     
     def get_key_word_sizes(self, keys: List[str]) -> List[int]:
         """Returns the number of words in each key"""

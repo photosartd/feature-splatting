@@ -182,9 +182,12 @@ class gaussian_editor:
         if 'xyz_min' in self.meta_editing_dict:
             assert 'min_offset' in kwargs and 'max_offset' in kwargs
             # Get object bounding box
-            bbox_particle_idx = self.filter_particles_ground_bbox(means,
-                                                                    kwargs['min_offset'],
-                                                                    kwargs['max_offset'])
+            if kwargs.get("chosen_gs_indices", None) is not None:
+                bbox_particle_idx = kwargs["chosen_gs_indices"]
+            else:
+                bbox_particle_idx = self.filter_particles_ground_bbox(means,
+                                                                        kwargs['min_offset'],
+                                                                        kwargs['max_offset'])
             # Hide particles outside the bounding box?
             if view_main_obj_only:
                 bg_idx = ~bbox_particle_idx
